@@ -33,3 +33,25 @@ func main() {
 	}
 }
 ```
+ ## Example torrent stream usage
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/PauliusLozys/eztv"
+)
+
+func main() {
+	client := eztv.New()
+	for s := range client.TorrentStream(context.Background(), eztv.StreamOptions{LastTorrentID: 0, ImdbID: "tt7908628"}) {
+		if s.Err != nil {
+			fmt.Println("Error:", s.Err)
+			continue
+		}
+		fmt.Println(s.Torrent.ID, s.Torrent.Title)
+	}
+}
+```

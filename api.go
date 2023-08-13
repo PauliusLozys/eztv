@@ -3,13 +3,23 @@ package eztv
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
-const EZTVBaseURL = "https://eztv.re/api"
+const (
+	EZTVBaseURL           = "https://eztv.re/api"
+	StreamRecheckInterval = 5 * time.Minute
+	MaxEZTVAPILimit       = 100
+)
+
+var ErrMissingImdbID = errors.New("missing imdbID")
 
 // URLOptions are the options that can be passed into EZTV API
 // for custom data retrieval.
@@ -21,6 +31,16 @@ type URLOptions struct {
 	Limit int
 	// ImdbID tag will retrieve torrents only for that exact show.
 	ImdbID string
+}
+
+// StreamOptions allow to customize the behaviour of the TorrentStream.
+type StreamOptions struct {
+	// Specifies what shows torrents to fetch.
+	ImdbID string
+	// Specifies from which torrent ID to start the stream.
+	LastTorrentID int
+	// Specifies how often to re-check for new torrents.
+	RecheckInterval time.Duration
 }
 
 // Client is the EZTV API client. It can make requests to the EZTV API to retrieve data.
@@ -84,4 +104,107 @@ func (c *Client) GetTorrents(ctx context.Context, urlOptions URLOptions) (*Page,
 	}
 
 	return &page, nil
+}
+
+// TorrentStream returns a channel that will push new torrents as they are added to the EZTV API.
+//
+// StreamOptions allow to specify LastTorrentID from which to start the stream. If LastTorrentID is 0,
+// it will do a full re-sync of all torrents for the given ImdbID.
+//
+// If no ImdID is specified, it will return ErrMissingImdbID error from stream and close it.
+//
+// If no RecheckInterval is specified, it will default to StreamRecheckInterval constant.
+func (c *Client) TorrentStream(ctx context.Context, streamOptions StreamOptions) <-chan StreamTorrent {
+	torrentsCh := make(chan StreamTorrent)
+
+	go func() {
+		defer close(torrentsCh)
+
+		lastTorrentID := streamOptions.LastTorrentID
+		imdbID := strings.TrimPrefix(streamOptions.ImdbID, "tt")
+		if imdbID == "" {
+			torrentsCh <- StreamTorrent{Err: ErrMissingImdbID}
+			return
+		}
+		recheckInterval := streamOptions.RecheckInterval
+		if recheckInterval == 0 {
+			recheckInterval = StreamRecheckInterval
+		}
+
+		if lastTorrentID == 0 { // Full re-sync.
+			lastTorrentID = c.fullStreamResync(ctx, torrentsCh, imdbID)
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(recheckInterval):
+				page, err := c.GetTorrents(ctx, URLOptions{
+					ImdbID: imdbID,
+					Page:   1,
+					Limit:  1,
+				})
+				if err != nil {
+					torrentsCh <- StreamTorrent{Err: err}
+					continue
+				}
+
+				if len(page.Torrents) == 0 || page.Torrents[0].ID <= lastTorrentID {
+					continue
+				}
+
+				lastTorrentID = page.Torrents[0].ID
+
+				torrentsCh <- StreamTorrent{
+					Torrent: page.Torrents[0],
+					Err:     nil,
+				}
+			}
+		}
+	}()
+
+	return torrentsCh
+}
+
+func (c *Client) fullStreamResync(ctx context.Context, torrentsCh chan<- StreamTorrent, imdbID string) int {
+	// Fetch first page to figure out the total number of torrents.
+	// And then re-sync backwards.
+	page, err := c.GetTorrents(ctx, URLOptions{
+		ImdbID: imdbID,
+		Page:   1,
+		Limit:  1,
+	})
+	if err != nil {
+		torrentsCh <- StreamTorrent{Err: err}
+		return 0
+	}
+
+	if page.TorrentsCount == 0 { // Nothing to re-sync.
+		return 0
+	}
+	pages := int(math.Ceil(float64(page.TorrentsCount) / MaxEZTVAPILimit))
+	lastTorrentID := 0
+	for i := pages; i > 0; i-- { // Re-sync backwards.
+		page, err := c.GetTorrents(ctx, URLOptions{
+			ImdbID: imdbID,
+			Page:   i,
+			Limit:  MaxEZTVAPILimit,
+		})
+		if err != nil {
+			torrentsCh <- StreamTorrent{Err: err}
+			return lastTorrentID
+		}
+
+		slices.Reverse(page.Torrents)
+		for _, torrent := range page.Torrents {
+			torrentsCh <- StreamTorrent{
+				Torrent: torrent,
+				Err:     nil,
+			}
+			lastTorrentID = torrent.ID
+		}
+	}
+
+	return lastTorrentID
 }

@@ -26,3 +26,9 @@ type Torrent struct {
 	DateReleasedUnix   int    `json:"date_released_unix"`
 	SizeBytes          string `json:"size_bytes"`
 }
+
+type StreamTorrent struct {
+	Torrent
+
+	Err error
+}
